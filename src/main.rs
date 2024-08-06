@@ -4,22 +4,40 @@ use anyhow::{bail, Context, Result};
 use clap::{ColorChoice, Parser};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use owo_colors::{OwoColorize, Rgb, Stream::Stdout, Style};
+use std::cell::OnceCell;
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::ops::Deref;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+// we reuse ColorChoice for your `--bpf` argument
+use clap::ColorChoice as BpfOption;
+
 use hidreport::hid::{
     CollectionItem, GlobalItem, Item, ItemType, LocalItem, MainDataItem, MainItem,
     ReportDescriptorItems,
 };
 use hidreport::*;
+
+use libbpf_rs::libbpf_sys;
+use libbpf_rs::skel::OpenSkel as _;
+use libbpf_rs::skel::SkelBuilder as _;
+
+mod hidrecord {
+    include!(env!("SKELFILE"));
+}
+mod hidrecord_tracing {
+    include!(env!("SKELFILE_TRACING"));
+}
+
+use hidrecord::*;
+use hidrecord_tracing::*;
 
 static mut OUTFILE: OnceLock<
     std::sync::Mutex<std::cell::RefCell<std::io::LineWriter<std::fs::File>>>,
@@ -86,6 +104,36 @@ impl Write for Outfile {
     }
 }
 
+const PACKET_SIZE: usize = 64;
+
+// A Rust version of hid_recorder_event in hidrecord.bpf.c
+// struct hid_recorder_event {
+// 	__u8 length;
+// 	__u8 data[64];
+// };
+#[allow(non_camel_case_types)]
+#[repr(C)]
+struct hid_recorder_event {
+    packet_count: u8,
+    packet_number: u8,
+    length: u8,
+    data: [u8; PACKET_SIZE],
+}
+
+// A Rust version of attach_prog_args in hidrecord_tracing.bpf.c
+// struct attach_prog_args {
+// 	int prog_fd;
+// 	unsigned int hid;
+// 	int retval;
+// };
+#[allow(non_camel_case_types)]
+#[repr(C)]
+struct attach_prog_args {
+    prog_fd: i32,
+    hid: u32,
+    retval: i32,
+}
+
 #[derive(Default)]
 enum Styles {
     #[default]
@@ -101,12 +149,14 @@ enum Styles {
     Report {
         report_id: ReportId,
     },
+    Bpf,
 }
 
 impl Styles {
     fn style(&self) -> Style {
         match self {
             Styles::None => Style::new(),
+            Styles::Bpf => Style::new().blue(),
             Styles::Data => Style::new().red(),
             Styles::Note => Style::new().red().bold(),
             Styles::InputItem => Style::new().green().bold(),
@@ -173,6 +223,12 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     only_describe: bool,
 
+    /// Also grab the events from the device through HID-BPF
+    /// (default to enable the output if a HID-BPF program
+    /// is detected on the target device).
+    #[arg(long, default_value_t = BpfOption::Auto)]
+    bpf: BpfOption,
+
     /// Path to the hidraw or event device node, or a binary
     /// hid descriptor file
     path: Option<PathBuf>,
@@ -188,6 +244,31 @@ struct RDescFile {
     bustype: u32,
     vid: u32,
     pid: u32,
+}
+
+#[derive(Debug)]
+pub enum BpfError {
+    LibBPFError { error: libbpf_rs::Error },
+    OsError { errno: u32 },
+}
+
+impl std::error::Error for BpfError {}
+
+impl std::fmt::Display for BpfError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BpfError::LibBPFError { error } => write!(f, "{error}"),
+            BpfError::OsError { errno } => {
+                write!(f, "{}", libbpf_rs::Error::from_raw_os_error(*errno as i32))
+            }
+        }
+    }
+}
+
+impl From<libbpf_rs::Error> for BpfError {
+    fn from(e: libbpf_rs::Error) -> BpfError {
+        BpfError::LibBPFError { error: e }
+    }
 }
 
 fn fmt_main_item(item: &MainItem) -> String {
@@ -990,17 +1071,29 @@ fn print_field_values(bytes: &[u8], field: &Field) {
     }
 }
 
-fn parse_input_report(bytes: &[u8], rdesc: &ReportDescriptor, start_time: &Instant) -> Result<()> {
+fn print_style_prefix(style: &Styles) {
+    cprint!(Styles::None, "# ");
+    cprint!(style, " ");
+}
+
+fn parse_input_report(
+    bytes: &[u8],
+    rdesc: &ReportDescriptor,
+    start_time: &Instant,
+    ringbuf: Option<&libbpf_rs::RingBuffer>,
+) -> Result<()> {
     let Some(report) = rdesc.find_input_report(bytes) else {
         bail!("Unable to find matching report");
     };
 
-    if let Some(id) = report.report_id() {
+    let report_style = if let Some(id) = report.report_id() {
         let report_style = Styles::Report { report_id: *id };
-        cprint!(Styles::None, "# ");
-        cprint!(report_style, " ");
+        print_style_prefix(&report_style);
         cprintln!(Styles::None, " Report ID: {id} / ");
-    }
+        report_style
+    } else {
+        Styles::None
+    };
 
     let collections: HashSet<&Collection> = report
         .fields()
@@ -1009,7 +1102,8 @@ fn parse_input_report(bytes: &[u8], rdesc: &ReportDescriptor, start_time: &Insta
         .filter(|c| matches!(c.collection_type(), CollectionType::Logical))
         .collect();
     if collections.is_empty() {
-        cprint!(Styles::None, "#                ");
+        print_style_prefix(&report_style);
+        cprint!(Styles::None, "              ");
         for field in report.fields() {
             print_field_values(bytes, field);
         }
@@ -1019,7 +1113,8 @@ fn parse_input_report(bytes: &[u8], rdesc: &ReportDescriptor, start_time: &Insta
         collections.sort_by(|a, b| a.id().partial_cmp(b.id()).unwrap());
 
         for collection in collections {
-            cprint!(Styles::None, "#                ");
+            print_style_prefix(&report_style);
+            cprint!(Styles::None, "              ");
             for field in report.fields().iter().filter(|f| {
                 // logical collections may be nested, so we only group those items together
                 // where the deepest logical collection matches
@@ -1034,6 +1129,10 @@ fn parse_input_report(bytes: &[u8], rdesc: &ReportDescriptor, start_time: &Insta
             }
             cprintln!();
         }
+    }
+
+    if let Some(ringbuf) = ringbuf {
+        let _ = ringbuf.consume();
     }
 
     let elapsed = start_time.elapsed();
@@ -1054,12 +1153,13 @@ fn parse_input_report(bytes: &[u8], rdesc: &ReportDescriptor, start_time: &Insta
 
 fn print_current_time(last_timestamp: Option<Instant>) -> Option<Instant> {
     let prev_timestamp = last_timestamp.unwrap_or(Instant::now());
-
-    if last_timestamp.is_none() || prev_timestamp.elapsed().as_secs() > 5 {
+    let elapsed = prev_timestamp.elapsed().as_secs();
+    let now = chrono::prelude::Local::now();
+    if last_timestamp.is_none() || (elapsed > 1 && now.timestamp() % 5 == 0) {
         cprintln!(
             Styles::Timestamp,
             "# Current time: {}",
-            chrono::prelude::Local::now().format("%H:%M:%S").to_string()
+            now.format("%H:%M:%S").to_string()
         );
         Some(Instant::now())
     } else {
@@ -1067,7 +1167,11 @@ fn print_current_time(last_timestamp: Option<Instant>) -> Option<Instant> {
     }
 }
 
-fn read_events(path: &Path, rdesc: &ReportDescriptor) -> Result<()> {
+fn read_events(
+    path: &Path,
+    rdesc: &ReportDescriptor,
+    map_ringbuf: Option<&libbpf_rs::Map>,
+) -> Result<()> {
     cprintln!(
         Styles::Separator,
         "##############################################################################"
@@ -1084,27 +1188,66 @@ fn read_events(path: &Path, rdesc: &ReportDescriptor) -> Result<()> {
         .custom_flags(libc::O_NONBLOCK)
         .open(path)?;
 
-    let timeout = PollTimeout::try_from(-1).unwrap();
-    let mut start_time: Option<Instant> = None;
+    let timeout = PollTimeout::try_from(1000).unwrap();
+    let start_time: OnceCell<Instant> = OnceCell::new();
     let mut last_timestamp: Option<Instant> = None;
     let mut data = [0; 1024];
+    let mut bpf_vec = Vec::new();
+
+    let ringbuf = map_ringbuf.map(|map_ringbuf| {
+        let mut builder = libbpf_rs::RingBufferBuilder::new();
+        builder
+            .add(map_ringbuf, |data| {
+                event_handler(data, &mut bpf_vec, &start_time)
+            })
+            .unwrap();
+        builder.build().unwrap()
+    });
+
     loop {
-        let mut pollfds = [PollFd::new(f.as_fd(), PollFlags::POLLIN)];
-        if poll(&mut pollfds, timeout)? > 0 {
-            match f.read(&mut data) {
-                Ok(_nbytes) => {
-                    last_timestamp = print_current_time(last_timestamp);
-                    if start_time.is_none() {
-                        start_time = last_timestamp;
-                    }
-                    parse_input_report(&data, rdesc, &start_time.unwrap())?;
-                }
-                Err(e) => {
-                    if e.kind() != std::io::ErrorKind::WouldBlock {
-                        bail!(e);
-                    }
-                }
+        let mut pollfds = vec![PollFd::new(f.as_fd(), PollFlags::POLLIN)];
+        if let Some(ref ringbuf) = ringbuf {
+            let ringbuf_fd = unsafe {
+                std::os::fd::BorrowedFd::borrow_raw(ringbuf.epoll_fd() as std::os::fd::RawFd)
             };
+            pollfds.push(PollFd::new(ringbuf_fd, PollFlags::POLLIN));
+        }
+
+        if poll(&mut pollfds, timeout)? > 0 {
+            let has_events: Vec<bool> = pollfds
+                .iter()
+                .map(|fd| fd.revents())
+                .map(|revents| revents.map_or(false, |flag| flag.intersects(PollFlags::POLLIN)))
+                .collect();
+
+            if has_events[0] {
+                match f.read(&mut data) {
+                    Ok(_nbytes) => {
+                        last_timestamp = print_current_time(last_timestamp);
+                        let _ = start_time.get_or_init(|| last_timestamp.unwrap());
+                        parse_input_report(
+                            &data,
+                            rdesc,
+                            start_time.get().unwrap(),
+                            ringbuf.as_ref(),
+                        )?;
+                    }
+                    Err(e) => {
+                        if e.kind() != std::io::ErrorKind::WouldBlock {
+                            bail!(e);
+                        }
+                    }
+                };
+            }
+            if *has_events.get(1).unwrap_or(&false) {
+                if let Some(ref ringbuf) = ringbuf {
+                    last_timestamp = print_current_time(last_timestamp);
+                    let _ = start_time.get_or_init(|| last_timestamp.unwrap());
+                    let _ = ringbuf.consume();
+                }
+            }
+        } else if last_timestamp.is_some() {
+            print_current_time(last_timestamp);
         }
     }
 }
@@ -1139,6 +1282,162 @@ fn find_device() -> Result<PathBuf> {
     Ok(path)
 }
 
+fn event_handler(
+    data: &[u8],
+    buffer: &mut Vec<u8>,
+    start_time: &OnceCell<Instant>,
+) -> ::std::os::raw::c_int {
+    if data.len() != std::mem::size_of::<hid_recorder_event>() {
+        eprintln!(
+            "Invalid size {} != {}",
+            data.len(),
+            std::mem::size_of::<hid_recorder_event>()
+        );
+        return 1;
+    }
+
+    let event = unsafe { &*(data.as_ptr() as *const hid_recorder_event) };
+
+    if event.length == 0 {
+        return 1;
+    }
+
+    let elapsed = start_time.get().unwrap().elapsed();
+
+    let size = if event.packet_number == event.packet_count - 1 {
+        event.length as usize - event.packet_number as usize * PACKET_SIZE
+    } else {
+        PACKET_SIZE
+    };
+
+    if event.packet_number == 0 {
+        buffer.clear();
+    }
+
+    buffer.extend_from_slice(&event.data[..size]);
+
+    if event.packet_number == event.packet_count - 1 {
+        let bytes = buffer
+            .iter()
+            .fold("".to_string(), |acc, b| format!("{acc}{b:02x} "));
+        cprintln!(
+            Styles::Bpf,
+            "B: {:06}.{:06} {} {}",
+            elapsed.as_secs(),
+            elapsed.as_micros() % 1000000,
+            buffer.len(),
+            bytes,
+        );
+    }
+    0
+}
+
+enum HidBpfSkel {
+    None,
+    StructOps(Box<HidrecordSkel<'static>>),
+    Tracing(Box<HidrecordTracingSkel<'static>>, u32),
+}
+
+fn print_to_log(level: libbpf_rs::PrintLevel, msg: String) {
+    /* we strip out the 3 following lines that happen when the kernel
+     * doesn't support HID-BPF struct_ops
+     */
+    let ignore_msgs = [
+        "struct bpf_struct_ops_hid_bpf_ops is not found in kernel BTF",
+        "failed to load object 'hidrecord_bpf'",
+        "failed to load BPF skeleton 'hidrecord_bpf': -2",
+    ];
+    if ignore_msgs.iter().any(|ignore| msg.contains(ignore)) {
+        return;
+    }
+    match level {
+        libbpf_rs::PrintLevel::Info => cprintln!(Styles::Bpf, "{}", msg.trim()),
+        libbpf_rs::PrintLevel::Warn => cprintln!(Styles::Note, "{}", msg.trim()),
+        _ => (),
+    }
+}
+
+fn preload_bpf_tracer(use_bpf: BpfOption, path: &Path) -> Result<HidBpfSkel> {
+    let sysfs = find_sysfs_path(path)?.canonicalize()?;
+    let hid_id = u32::from_str_radix(
+        sysfs
+            .extension()
+            .unwrap()
+            .to_str()
+            .expect("not a hex value"),
+        16,
+    )
+    .unwrap();
+
+    let sysfs_name = sysfs
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .replace([':', '.'], "_");
+
+    let bpffs = PathBuf::from("/sys/fs/bpf/hid/").join(sysfs_name);
+
+    let enable_bpf = match use_bpf {
+        BpfOption::Never => false,
+        BpfOption::Always => true,
+        BpfOption::Auto => bpffs.exists(),
+    };
+
+    if !enable_bpf {
+        return Ok(HidBpfSkel::None);
+    }
+
+    libbpf_rs::set_print(Some((libbpf_rs::PrintLevel::Info, print_to_log)));
+
+    let skel_builder = HidrecordSkelBuilder::default();
+    let mut open_skel = skel_builder.open().unwrap();
+    let hid_record_update = open_skel.struct_ops.hid_record_mut();
+    hid_record_update.hid_id = hid_id as i32;
+
+    if let Ok(skel) = open_skel.load() {
+        return Ok(HidBpfSkel::StructOps(Box::new(skel)));
+    }
+
+    let skel_builder = HidrecordTracingSkelBuilder::default();
+    let skel = skel_builder.open()?.load()?;
+    Ok(HidBpfSkel::Tracing(Box::new(skel), hid_id))
+}
+
+fn run_syscall_prog_generic<T>(prog: &libbpf_rs::Program, data: T) -> Result<T, BpfError> {
+    let fd = prog.as_fd().as_raw_fd();
+    let data_ptr: *const libc::c_void = &data as *const _ as *const libc::c_void;
+    let mut run_opts = libbpf_sys::bpf_test_run_opts {
+        sz: std::mem::size_of::<libbpf_sys::bpf_test_run_opts>()
+            .try_into()
+            .unwrap(),
+        ctx_in: data_ptr,
+        ctx_size_in: std::mem::size_of::<T>() as u32,
+        ..Default::default()
+    };
+
+    let run_opts_ptr: *mut libbpf_sys::bpf_test_run_opts = &mut run_opts;
+
+    match unsafe { libbpf_sys::bpf_prog_test_run_opts(fd, run_opts_ptr) } {
+        0 => Ok(data),
+        e => Err(BpfError::OsError { errno: -e as u32 }),
+    }
+}
+
+fn run_syscall_prog_attach(
+    prog: &libbpf_rs::Program,
+    attach_args: attach_prog_args,
+) -> Result<i32, BpfError> {
+    let args = run_syscall_prog_generic(prog, attach_args)?;
+    if args.retval < 0 {
+        Err(BpfError::OsError {
+            errno: -args.retval as u32,
+        })
+    } else {
+        Ok(args.retval)
+    }
+}
+
 fn hid_recorder() -> Result<()> {
     let cli = Cli::parse();
 
@@ -1154,7 +1453,26 @@ fn hid_recorder() -> Result<()> {
 
     let rdesc = parse(&rdesc_file, &opts)?;
     if !cli.only_describe && path.starts_with("/dev") {
-        read_events(&path, &rdesc)?
+        match preload_bpf_tracer(cli.bpf, &path)? {
+            HidBpfSkel::None => read_events(&path, &rdesc, None)?,
+            HidBpfSkel::StructOps(skel) => {
+                let maps = skel.maps();
+                // We need to keep _link around or the program gets immediately removed
+                let _link = maps.hid_record().attach_struct_ops()?;
+                read_events(&path, &rdesc, Some(maps.events()))?
+            }
+            HidBpfSkel::Tracing(skel, hid_id) => {
+                let attach_args = attach_prog_args {
+                    prog_fd: skel.progs().hid_record_event().as_fd().as_raw_fd(),
+                    hid: hid_id,
+                    retval: -1,
+                };
+
+                let _link =
+                    run_syscall_prog_attach(skel.progs().attach_prog(), attach_args).unwrap();
+                read_events(&path, &rdesc, Some(skel.maps().events()))?
+            }
+        }
     }
     Ok(())
 }
